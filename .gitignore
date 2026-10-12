@@ -1,0 +1,11 @@
+node_modules/
+bun.lock
+xsetup.json
+.env
+.dev.vars
+files/
+xcr-data/
+*.log
+PLAN.md
+cdk/node_modules/
+cdk/cdk.out/
