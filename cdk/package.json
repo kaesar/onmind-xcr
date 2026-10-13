@@ -1,0 +1,21 @@
+{
+  "name": "xcr-cdk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AWS CDK (JavaScript) infrastructure for OnMind-XCR: Lambda + S3 + HTTP API",
+  "bin": {
+    "xcr-cdk": "bin/app.js"
+  },
+  "scripts": {
+    "synth": "cdk synth",
+    "diff": "cdk diff",
+    "deploy": "cdk deploy",
+    "destroy": "cdk destroy",
+    "bootstrap": "cdk bootstrap"
+  },
+  "devDependencies": {
+    "aws-cdk": "^2",
+    "aws-cdk-lib": "^2",
+    "constructs": "^10.0.0"
+  }
+}

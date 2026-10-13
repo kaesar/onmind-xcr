@@ -1,0 +1,10 @@
+{
+  "app": "node bin/app.js",
+  "context": {
+    "bucketPrefix": "",
+    "xcrEnv": "production",
+    "removalPolicy": "retain",
+    "corsOrigins": "",
+    "localEndpoint": ""
+  }
+}

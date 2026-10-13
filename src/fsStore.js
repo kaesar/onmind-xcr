@@ -17,7 +17,7 @@ function ensureRepoDoc(doc, name) {
 }
 
 export function fsStore(root) {
-  const reposPath = join(root, "repos.json");
+  const reposPath = join(root, "xrepos.json");
   const blobPath = (digest) => {
     const { hex, prefix } = digestToParts(digest);
     return join(root, "blobs", "sha256", prefix, hex);

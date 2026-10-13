@@ -151,6 +151,66 @@ const MANIFEST_DIGEST = await sha256Digest(MANIFEST_BYTES);
   check("s3 without bucket throws", /XCR_S3_BUCKET/.test(noBucket), noBucket.slice(0, 80));
 }
 
+// 9 presigned direct-to-S3 (xcr extension)
+{
+  const pj = (p, b) => req(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
+  const denyPut = await J(await pj("/v2/demo/hello/blobs/presigned-put", { digest: BLOB_DIGEST }));
+  check("filesystem presigned-put 400 DENIED", denyPut.errors?.[0]?.code === "DENIED", JSON.stringify(denyPut).slice(0, 120));
+  const denyDone = await J(await pj("/v2/demo/hello/blobs/presigned-complete", { digest: BLOB_DIGEST }));
+  check("filesystem presigned-complete 400 DENIED", denyDone.errors?.[0]?.code === "DENIED");
+
+  // s3 signing is offline (no network): fake endpoint + creds, IMDS disabled.
+  const savedAccess = process.env.AWS_ACCESS_KEY_ID;
+  const savedSecret = process.env.AWS_SECRET_ACCESS_KEY;
+  const savedImds = process.env.AWS_EC2_METADATA_DISABLED;
+  process.env.AWS_ACCESS_KEY_ID = "test";
+  process.env.AWS_SECRET_ACCESS_KEY = "test";
+  process.env.AWS_EC2_METADATA_DISABLED = "true";
+  try {
+    const s3store = storageFromEnv({
+      XCR_STORAGE: "s3",
+      XCR_S3_BUCKET: "xcr-test",
+      XCR_S3_ENDPOINT: "http://127.0.0.1:9",
+      XCR_S3_REGION: "us-east-1",
+      XCR_PRESIGNED_TTL: "900",
+    });
+    const s3app = createApp({ XCR_ENV: "dev" }, s3store);
+    const sreq = (p, init) => s3app.request(p, init);
+    const put = await sreq("/v2/demo/big/blobs/presigned-put", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ digest: BLOB_DIGEST }),
+    });
+    const putJ = await put.json();
+    const expectedB64 = Buffer.from(BLOB_DIGEST.slice("sha256:".length), "hex").toString("base64");
+    check(
+      "s3 presigned-put 200 + signed URL + sha256 checksum",
+      put.status === 200 &&
+        typeof putJ.url === "string" &&
+        putJ.url.includes("X-Amz-Signature") &&
+        putJ.url.includes("xcr-test") &&
+        putJ.headers?.["x-amz-checksum-sha256"] === expectedB64 &&
+        putJ.expiresIn === 900,
+      JSON.stringify(putJ).slice(0, 200)
+    );
+    // presigned URLs are pure signing: the GET signer works offline too.
+    const signed = await s3store.presignedGetUrl(BLOB_DIGEST);
+    check("s3 presigned-get signs offline", typeof signed.url === "string" && signed.url.includes("X-Amz-Signature"));
+    // complete without S3 behind it fails loudly (never 201).
+    const done = await sreq("/v2/demo/big/blobs/presigned-complete", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ digest: BLOB_DIGEST }),
+    });
+    check("s3 presigned-complete without backend never 201", done.status !== 201, String(done.status));
+  } finally {
+    if (savedAccess === undefined) delete process.env.AWS_ACCESS_KEY_ID;
+    else process.env.AWS_ACCESS_KEY_ID = savedAccess;
+    if (savedSecret === undefined) delete process.env.AWS_SECRET_ACCESS_KEY;
+    else process.env.AWS_SECRET_ACCESS_KEY = savedSecret;
+    if (savedImds === undefined) delete process.env.AWS_EC2_METADATA_DISABLED;
+    else process.env.AWS_EC2_METADATA_DISABLED = savedImds;
+  }
+}
+
 await rm(dir, { recursive: true, force: true });
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -55,6 +55,7 @@ export function createApp(env = process.env, storage = null) {
   // ---- Dispatcher for repo-scoped routes (names may contain slashes) ----
   app.all("/v2/*", async (c) => {
     c.header("Docker-Distribution-Api-Version", "registry/2.0");
+    const presignedReads = String(env.XCR_PRESIGNED_READS ?? "true").toLowerCase() !== "false";
     const method = c.req.method;
     const path = c.req.path; // e.g. /v2/demo/hello/tags/list
     const rest = path.slice("/v2".length); // /demo/hello/tags/list
@@ -80,6 +81,19 @@ export function createApp(env = process.env, storage = null) {
         return ociJson(c, ociError("METHOD_UNKNOWN", "Method not allowed", 405));
       }
 
+      // presigned direct-to-S3 (s3 only, xcr extension — not OCI standard):
+      // /<name>/blobs/presigned-put | /<name>/blobs/presigned-complete
+      const ps = rest.match(/^(.*)\/blobs\/(presigned-put|presigned-complete)$/);
+      if (ps) {
+        const name = ps[1].replace(/^\//, "");
+        validateName(name);
+        if (method !== "POST") return ociJson(c, ociError("METHOD_UNKNOWN", "Method not allowed", 405));
+        if (store.mode !== "s3" || typeof store.presignedPutUrl !== "function") {
+          return ociJson(c, ociError("DENIED", "Presigned upload requires s3 storage", 400));
+        }
+        return await handlePresigned(c, store, name, ps[2]);
+      }
+
       // blobs: /<name>/blobs/<digest>
       const bl = rest.match(/^(.*)\/blobs\/(.+)$/);
       if (bl && !bl[1].endsWith("/uploads")) {
@@ -88,7 +102,7 @@ export function createApp(env = process.env, storage = null) {
         validateName(name);
         if (!(await store.repoExists(name))) return ociJson(c, ociError("NAME_UNKNOWN", `Repository not found: ${name}`));
         validateDigest(digest);
-        if (method === "GET" || method === "HEAD") return await handleBlobRead(c, store, digest, method === "HEAD");
+        if (method === "GET" || method === "HEAD") return await handleBlobRead(c, store, digest, method === "HEAD", presignedReads);
         return ociJson(c, ociError("METHOD_UNKNOWN", "Method not allowed", 405));
       }
 
@@ -274,7 +288,57 @@ async function handleUploadComplete(c, store, name, uuid) {
   return c.body(null, 201);
 }
 
-async function handleBlobRead(c, store, digest, headOnly) {
+async function handlePresigned(c, store, name, op) {
+  let body = {};
+  try {
+    body = await c.req.json();
+  } catch {
+    return ociJson(c, ociError("MANIFEST_INVALID", "Invalid JSON", 400));
+  }
+  const digest = body.digest || "";
+  try {
+    validateDigest(digest);
+  } catch (e) {
+    return ociJson(c, ociError(e.code || "DIGEST_INVALID", e.message, e.status || 400));
+  }
+  if (op === "presigned-put") {
+    // Pure URL issuance (stateless): repo is created at complete time
+    // (trackBlob ensures it), so signing never needs the backend.
+    const { url, checksumSha256, expiresIn } = await store.presignedPutUrl(digest);
+    return c.json({
+      digest,
+      method: "PUT",
+      url,
+      expiresIn,
+      headers: { "Content-Type": "application/octet-stream", "x-amz-checksum-sha256": checksumSha256 },
+      note: "PUT raw bytes to url with the given headers; S3 itself rejects bytes that don't match the digest; then call presigned-complete",
+    });
+  }
+  // presigned-complete: verify via HeadObject only (no bytes through the app).
+  const st = await store.blobStat(digest);
+  if (!st) return ociJson(c, ociError("BLOB_UNKNOWN", `Blob not found: ${digest}`));
+  const expectedB64 = Buffer.from(digest.slice("sha256:".length), "hex").toString("base64");
+  if (st.checksumSha256 && st.checksumSha256 !== expectedB64) {
+    return ociJson(c, ociError("DIGEST_INVALID", "S3 checksum does not match digest (re-upload via presigned-put)", 400));
+  }
+  if (body.size != null && Number(body.size) !== st.size) {
+    return ociJson(c, ociError("DIGEST_INVALID", `Size mismatch (expected ${body.size}, got ${st.size})`, 400));
+  }
+  await store.trackBlob(name, digest);
+  c.header("Docker-Content-Digest", digest);
+  return c.json({ digest, size: st.size }, 201);
+}
+
+async function handleBlobRead(c, store, digest, headOnly, presignedReads = false) {
+  // Pull offload in s3 mode: docker follows 307, bytes bypass the app.
+  // HEAD stays proxied (cheap metadata, no redirect semantics needed).
+  if (!headOnly && presignedReads && store.mode === "s3" && typeof store.presignedGetUrl === "function") {
+    const st = await store.blobStat(digest);
+    if (!st) return ociJson(c, ociError("BLOB_UNKNOWN", `Blob not found: ${digest}`));
+    const { url } = await store.presignedGetUrl(digest);
+    c.header("Docker-Content-Digest", digest);
+    return c.redirect(url, 307);
+  }
   if (headOnly) {
     const st = await store.blobStat(digest);
     if (!st) return ociJson(c, ociError("BLOB_UNKNOWN", `Blob not found: ${digest}`));

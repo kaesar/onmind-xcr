@@ -2,7 +2,7 @@ import { nowIso, newUploadUuid } from "./ids.js";
 import { digestToParts } from "./validate.js";
 
 // S3 backend: same contract as fsStore. Blobs/manifests are objects,
-// repos.json is a single object with read-modify-write (single-writer v1).
+// xrepos.json is a single object with read-modify-write (single-writer v1).
 export function s3Store(env = process.env) {
   const bucket = env.XCR_S3_BUCKET || "";
   if (!bucket) throw new Error('xcr: XCR_S3_BUCKET is required when XCR_STORAGE=s3');
@@ -15,7 +15,7 @@ export function s3Store(env = process.env) {
       ? String(env.XCR_S3_FORCE_PATH_STYLE).toLowerCase() === "true"
       : !!endpoint;
 
-  const keyRepos = `${prefix}repos.json`;
+  const keyRepos = `${prefix}xrepos.json`;
   const keyBlob = (digest) => {
     const { hex, prefix: p } = digestToParts(digest);
     return `${prefix}blobs/sha256/${p}/${hex}`;
@@ -65,6 +65,42 @@ export function s3Store(env = process.env) {
 
   function emptyRepos() {
     return { format: "xcr/v1", repos: {} };
+  }
+
+  function presignedTtl() {
+    const raw = parseInt(env.XCR_PRESIGNED_TTL || "900", 10);
+    if (!Number.isFinite(raw)) return 900;
+    return Math.min(Math.max(raw, 60), 3600);
+  }
+
+  // Direct-to-S3 upload: presigned PUT whose signed ChecksumSHA256 header
+  // forces S3 itself to reject bytes that don't match the digest. The app
+  // never touches the bytes — Lambda payload limits don't apply.
+  async function presignedPutUrl(digest) {
+    const { PutObjectCommand } = await import("@aws-sdk/client-s3");
+    const { getSignedUrl } = await import("@aws-sdk/s3-request-presigner");
+    const db = await client();
+    const { hex } = digestToParts(digest);
+    const checksumB64 = Buffer.from(hex, "hex").toString("base64");
+    const expiresIn = presignedTtl();
+    const cmd = new PutObjectCommand({
+      Bucket: bucket,
+      Key: keyBlob(digest),
+      ContentType: "application/octet-stream",
+      ChecksumSHA256: checksumB64,
+    });
+    const url = await getSignedUrl(db, cmd, { expiresIn });
+    return { url, checksumSha256: checksumB64, expiresIn };
+  }
+
+  // Pull offload: docker follows 307 to S3, bytes bypass the app entirely.
+  async function presignedGetUrl(digest) {
+    const { GetObjectCommand } = await import("@aws-sdk/client-s3");
+    const { getSignedUrl } = await import("@aws-sdk/s3-request-presigner");
+    const db = await client();
+    const expiresIn = presignedTtl();
+    const url = await getSignedUrl(db, new GetObjectCommand({ Bucket: bucket, Key: keyBlob(digest) }), { expiresIn });
+    return { url, expiresIn };
   }
 
   async function readRepos() {
@@ -233,7 +269,7 @@ export function s3Store(env = process.env) {
       const db = await client();
       try {
         const out = await db.send(new HeadObjectCommand({ Bucket: bucket, Key: keyBlob(digest) }));
-        return { size: out.ContentLength ?? 0 };
+        return { size: out.ContentLength ?? 0, checksumSha256: out.ChecksumSHA256 ?? null };
       } catch (e) {
         if (e.name === "NotFound" || e.$metadata?.httpStatusCode === 404) return null;
         throw e;
@@ -306,6 +342,14 @@ export function s3Store(env = process.env) {
       await deleteObject(keyUpload(uuid));
       await deleteObject(keyUploadMeta(uuid));
       return true;
+    },
+
+    async presignedPutUrl(digest) {
+      return presignedPutUrl(digest);
+    },
+
+    async presignedGetUrl(digest) {
+      return presignedGetUrl(digest);
     },
   };
 }
